@@ -571,19 +571,28 @@ def gs_waterfall_chart(design_cost, offsider_cost, stocktake_cost, live_cost, cu
 
 def drilling_slice():
     u = filter_dates(DATA["usage"])
-    u = u[u["category"] == "drilling"]
+    if u.empty or "category" not in u.columns:
+        u = pd.DataFrame()
+    else:
+        u = u[u["category"] == "drilling"]
     return attach_cost(u)
 
 
 def gs_live_slice():
     g = filter_dates(DATA["gs_live"])
-    g = g[g["category"] == "ground_support"]
+    if g.empty or "category" not in g.columns:
+        g = pd.DataFrame()
+    else:
+        g = g[g["category"] == "ground_support"]
     return attach_gs_cost(g)
 
 
 def gs_offsider_slice():
     g = filter_dates(DATA["gs_offsider"])
-    g = g[g["category"] == "ground_support"]
+    if g.empty or "category" not in g.columns:
+        g = pd.DataFrame()
+    else:
+        g = g[g["category"] == "ground_support"]
     return attach_gs_cost(g)
 
 
@@ -793,10 +802,15 @@ def design_required_cost(months: list[str] | None = None):
     if gss_design.empty or cut_length_m is None:
         return None
     if months is None:
-        by_portal = productivity_summary()["by_portal"] if productivity_summary() else pd.DataFrame()
+        _prod = productivity_summary()
+        by_portal = _prod["by_portal"] if _prod else pd.DataFrame()
     else:
-        pr = DATA["production"][DATA["production"]["month_tab"].isin(months)]
+        pr_all = DATA["production"]
         by_portal = pd.DataFrame(columns=["advance_m"])
+        if pr_all.empty or "month_tab" not in pr_all.columns:
+            pr = pd.DataFrame()
+        else:
+            pr = pr_all[pr_all["month_tab"].isin(months)]
         if not pr.empty and "Heading name" in pr.columns and "EOM Advance" in pr.columns:
             d = pr.copy()
             d["EOM Advance"] = pd.to_numeric(d["EOM Advance"], errors="coerce")
@@ -1400,7 +1414,10 @@ def render_leakage_bityield():
     may_jul_gs_stk = pd.concat([stocktake_category_slice("ground_support", m) for m in ["May", "June", "July"]], ignore_index=True)
     stk_gs_cost = total_or_none(may_jul_gs_stk["cost"]) if not may_jul_gs_stk.empty else None
     live_may_jul = filter_dates(DATA["gs_live"])
-    live_may_jul = live_may_jul[(live_may_jul["category"] == "ground_support") & (live_may_jul["date"] < pd.Timestamp(2026, 8, 1))]
+    if live_may_jul.empty or "category" not in live_may_jul.columns:
+        live_may_jul = pd.DataFrame()
+    else:
+        live_may_jul = live_may_jul[(live_may_jul["category"] == "ground_support") & (live_may_jul["date"] < pd.Timestamp(2026, 8, 1))]
     live_cost = total_or_none(attach_gs_cost(live_may_jul)["cost"]) if not live_may_jul.empty else None
     offsider_cost = total_or_none(gs_offsider_slice()["cost"])
     design_cost = design_required_cost(months=["May", "June", "July"])
