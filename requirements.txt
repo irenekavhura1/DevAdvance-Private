@@ -3,3 +3,6 @@ pandas>=2.0
 plotly>=6.0
 openpyxl>=3.1
 streamlit-aggrid>=1.2
+xlsxwriter>=3.2
+fpdf2>=2.8
+python-docx>=1.2

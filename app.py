@@ -91,7 +91,16 @@ def inject_css(T: dict):
         [data-testid="stMetricValue"] {{ color: {T['text']}; }}
         [data-testid="stMetricLabel"] {{ color: {T['subtext']}; }}
         div[data-testid="stDataFrame"] {{ border: 1px solid {T['card_border']}; border-radius: 8px; }}
-        .stButton button, .stDownloadButton button {{ border-radius: 8px; }}
+        .stButton button, .stDownloadButton button, [data-testid="stFileUploader"] button {{
+            border-radius: 8px; background-color: {T['card_bg']}; color: {T['text']} !important;
+            border: 1px solid {T['card_border']};
+        }}
+        .stButton button:hover, .stDownloadButton button:hover, [data-testid="stFileUploader"] button:hover {{
+            border-color: {T['accent']}; color: {T['accent']} !important;
+        }}
+        [data-testid="stFileUploaderDropzone"] {{ background-color: {T['card_bg']}; border: 1px dashed {T['card_border']}; }}
+        .stButton button[kind="primary"] {{ background-color: {T['accent']}; color: {T['bg']} !important; border: none; }}
+        .stButton button[kind="primary"]:hover {{ background-color: {T['accent']}; color: {T['bg']} !important; opacity: 0.85; }}
         section[data-testid="stSidebar"] div[data-testid="stImage"] {{
             background:#0E1117; border-radius: 12px; padding: 14px; margin-bottom: 6px;
         }}
@@ -267,21 +276,35 @@ DATA["plod"] = _clip_to_analysis_window(DATA["plod"])
 
 
 @st.cache_data
-def combined_price_table():
+def price_source_comparison():
+    """Diagnostic only, never used to price anything: shows where the price
+    baked into the monthly stock-usage workbook (what a shift record happens
+    to say it cost) disagrees with the official static price list. Per
+    direct confirmation, the static list is the mine's real, authoritative
+    price -- any disagreement here means the *operational workbook* has a
+    stale or mistyped unit cost for that item, not the other way round."""
     _, monthly_totals = nl.load_drilling_usage_master()
     embedded = nl.build_embedded_drilling_price_table(monthly_totals)
     flat = DATA["prices"]
-    flat_only = nl.flat_only_items_with_no_embedded_price(monthly_totals, flat)
-    excluded_items = set(flat_only.loc[flat_only["shares_t45_anomaly_pattern"], "item"])
-    flat_usable = flat[~flat["item"].isin(excluded_items)]
-    combined = pd.concat([embedded[["item", "unit_price"]], flat_usable[["item", "unit_price"]]], ignore_index=True)
-    combined = combined.dropna(subset=["unit_price"]).drop_duplicates(subset=["item"], keep="first")
-    return combined, flat_only
+    embedded_map = embedded.set_index("item")["unit_price"]
+    flat_map = flat.dropna(subset=["unit_price"]).drop_duplicates(subset=["item"]).set_index("item")["unit_price"]
+    joined = pd.DataFrame({"operational_workbook_price": embedded_map, "official_price_list": flat_map}).dropna()
+    if joined.empty:
+        return joined
+    joined["ratio"] = joined["official_price_list"] / joined["operational_workbook_price"]
+    mismatched = joined[(joined["ratio"] > 1.5) | (joined["ratio"] < 1 / 1.5)]
+    return mismatched.reset_index().rename(columns={"index": "item"})
 
 
 def price_map() -> pd.Series:
-    combined, _ = combined_price_table()
-    return combined.set_index("item")["unit_price"]
+    """Ground truth for every cost computation in this app: the official
+    static unit price list only (GS_UNIT_costs.xlsx for drilling,
+    Consumables_Unit_Costs.xlsx for ground support). No other price source
+    is blended in, per direct confirmation that this list is authoritative
+    -- an item with no entry here shows as unpriced rather than falling
+    back to a number from a different, unconfirmed source."""
+    flat = DATA["prices"]
+    return flat.dropna(subset=["unit_price"]).drop_duplicates(subset=["item"], keep="first").set_index("item")["unit_price"]
 
 
 def attach_cost(df: pd.DataFrame, item_col="item", qty_col="qty") -> pd.DataFrame:
@@ -455,7 +478,7 @@ def yield_gauge(pct_value: float, title: str):
     return fig
 
 
-def gs_treemap(item_costs: pd.Series, top_n=14):
+def cost_treemap(item_costs: pd.Series, top_n=14):
     s = item_costs.dropna()
     s = s[s > 0].sort_values(ascending=False).head(top_n)
     if s.empty:
@@ -496,27 +519,43 @@ def sensitivity_curve_chart(curve: pd.DataFrame, cur: str, baseline_rate: float,
     return fig
 
 
-def gs_waterfall_chart(design_cost, stocktake_cost, live_cost, offsider_cost, cur):
-    x, measure, y, text = [], [], [], []
-    if design_cost is not None:
-        x.append("Design requirement"); measure.append("absolute"); y.append(design_cost); text.append(fmt_money(design_cost, cur, 0))
-        base = design_cost
-    else:
-        base = None
-    if stocktake_cost is not None and base is not None:
-        x.append("Δ to physical stocktake"); measure.append("relative"); y.append(stocktake_cost - base); text.append(fmt_money(stocktake_cost - base, cur, 0))
-    if stocktake_cost is not None:
-        x.append("Physical stocktake"); measure.append("total" if base is not None else "absolute"); y.append(stocktake_cost); text.append(fmt_money(stocktake_cost, cur, 0))
-        base = stocktake_cost
-    if live_cost is not None and base is not None:
-        x.append("Δ to live jumbo log"); measure.append("relative"); y.append(live_cost - base); text.append(fmt_money(live_cost - base, cur, 0))
-        x.append("Live jumbo log"); measure.append("total"); y.append(live_cost); text.append(fmt_money(live_cost, cur, 0))
-        base = live_cost
-    if offsider_cost is not None and base is not None:
-        x.append("Δ to offsider log"); measure.append("relative"); y.append(offsider_cost - base); text.append(fmt_money(offsider_cost - base, cur, 0))
-        x.append("Offsider log"); measure.append("total"); y.append(offsider_cost); text.append(fmt_money(offsider_cost, cur, 0))
-    if not x:
+def round_efficiency_chart(months, advance_per_round, support_n_per_m, cur):
+    """Dual-axis by design: advance-per-round (metres) and support unit cost
+    (currency/m) are different units, and the entire point of this chart is
+    to show them moving in opposite directions on the same month axis --
+    a single shared axis would misrepresent one of the two series."""
+    fig = go.Figure()
+    fig.add_bar(x=months, y=advance_per_round, name="Advance per round (m)", marker_color=T["accent"], yaxis="y1")
+    fig.add_scatter(x=months, y=support_n_per_m, name=f"Support unit cost ({cur}/m)", mode="lines+markers",
+                     line=dict(color=T["amber"], width=3), yaxis="y2")
+    layout = chart_layout(T)
+    layout["yaxis"] = dict(title="Advance per round (m)", gridcolor=T["grid"])
+    layout["yaxis2"] = dict(title=f"Support unit cost ({cur}/m)", overlaying="y", side="right", showgrid=False)
+    fig.update_layout(**layout)
+    return fig
+
+
+def gs_waterfall_chart(design_cost, offsider_cost, stocktake_cost, live_cost, cur):
+    """Design Required -> Offsider Issue Log -> Physical Stocktake is the
+    primary escalation (each step a genuinely more complete measurement of
+    the same consumption); Live Jumbo Log is appended as a fourth stage
+    since it's valuable corroborating data, not because it sits logically
+    between the other three. Every step/segment carries both its dollar
+    delta and the % change from the previous stage."""
+    stages = [("Design requirement", design_cost), ("Offsider issue log", offsider_cost),
+              ("Physical stocktake", stocktake_cost), ("Live jumbo log", live_cost)]
+    stages = [(label, val) for label, val in stages if val is not None]
+    if len(stages) < 2:
         return None
+    x, measure, y, text = [stages[0][0]], ["absolute"], [stages[0][1]], [fmt_money(stages[0][1], cur, 0)]
+    base = stages[0][1]
+    for label, val in stages[1:]:
+        delta = val - base
+        pct = safe_div(delta, base)
+        pct_txt = f" ({pct*100:+.0f}%)" if pct is not None else ""
+        x.append(f"Δ to {label.lower()}"); measure.append("relative"); y.append(delta); text.append(f"{fmt_money(delta, cur, 0)}{pct_txt}")
+        x.append(label); measure.append("total"); y.append(val); text.append(fmt_money(val, cur, 0))
+        base = val
     fig = go.Figure(go.Waterfall(
         x=x, measure=measure, y=y, text=text, textposition="outside",
         increasing=dict(marker=dict(color=T["red"])), decreasing=dict(marker=dict(color=T["green"])),
@@ -546,6 +585,16 @@ def gs_offsider_slice():
     g = filter_dates(DATA["gs_offsider"])
     g = g[g["category"] == "ground_support"]
     return attach_gs_cost(g)
+
+
+def drilling_offsider_slice():
+    """The offsider store-issue log's drilling-side crosscheck (May-July
+    only). Used only for discrepancy-checking against the physical
+    stocktake, never as a headline number -- see the leakage KPI."""
+    d = filter_dates(DATA["drill_offsider_cc"])
+    if d.empty:
+        return d
+    return attach_cost(d)
 
 
 def stocktake_category_slice(category: str, period_label: str | None = None) -> pd.DataFrame:
@@ -579,6 +628,21 @@ def stocktake_category_slice(category: str, period_label: str | None = None) -> 
     d["negative_usage_flag"] = d["used_qty"] < 0
     d["cost"] = np.where(d["negative_usage_flag"], np.nan, d["unit_price"] * d["used_qty"] * d["qty_multiplier"])
     return d
+
+
+def itemized_breakdown(stk_df: pd.DataFrame, qty_col="used_qty") -> pd.DataFrame:
+    """Item, quantity, unit price, cost, and % of category total -- the same
+    shape for drilling and ground support so both categories get identical
+    detail and layout."""
+    if stk_df.empty or "cost" not in stk_df.columns:
+        return pd.DataFrame()
+    agg = stk_df.groupby("item", dropna=False).agg(
+        quantity=(qty_col, "sum"), unit_price=("unit_price", "first"), cost=("cost", "sum"),
+    ).reset_index()
+    agg = agg.sort_values("cost", ascending=False, na_position="last")
+    total = agg["cost"].sum(skipna=True)
+    agg["pct_of_category"] = agg["cost"] / total * 100 if total else np.nan
+    return agg
 
 
 def stocktake_flagged_negative() -> pd.DataFrame:
@@ -714,18 +778,34 @@ def bit_life_calc() -> pd.DataFrame | None:
     return calc
 
 
-def design_required_cost():
+def design_required_cost(months: list[str] | None = None):
     """Whole-mine theoretical ground support spend implied by the approved
     design standard (minimum quantity per cut) applied to each portal's
     actual metres advanced. This is the closest thing to a 'budget' this
     dataset supports -- there is no independent drilling design/theoretical
-    benchmark loaded, so this figure is ground-support only."""
+    benchmark loaded, so this figure is ground-support only.
+
+    months restricts the portal-advance input to specific months (e.g. to
+    match a comparison stream, like the offsider log, that doesn't cover
+    the full analysed period) -- default is the whole analysed period."""
     gss_design = DATA["gss_design"]
     cut_length_m = DATA["cut_length_m"]
     if gss_design.empty or cut_length_m is None:
         return None
-    prod = productivity_summary()
-    if prod is None or prod["by_portal"].empty:
+    if months is None:
+        by_portal = productivity_summary()["by_portal"] if productivity_summary() else pd.DataFrame()
+    else:
+        pr = DATA["production"][DATA["production"]["month_tab"].isin(months)]
+        by_portal = pd.DataFrame(columns=["advance_m"])
+        if not pr.empty and "Heading name" in pr.columns and "EOM Advance" in pr.columns:
+            d = pr.copy()
+            d["EOM Advance"] = pd.to_numeric(d["EOM Advance"], errors="coerce")
+            d["portal"] = d["Heading name"].apply(nl.normalize_portal)
+            d, _ = restrict_to_portals(d)
+            if not d.empty:
+                by_portal = d.groupby("portal")["EOM Advance"].sum(min_count=1).rename("advance_m").to_frame()
+    prod = {"by_portal": by_portal}
+    if prod["by_portal"].empty:
         return None
     item_cols = [
         ("md_bolt_2_4m", "MD Bolt - 47mm - 2.4m", 1.0),
@@ -834,6 +914,58 @@ def portal_overbreak_summary(month_label: str | None = None):
     if d.empty:
         return pd.DataFrame()
     return d.groupby("portal")[["OverBreak", "UnderBreak"]].mean()
+
+
+def round_efficiency_table():
+    """Dynamic, non-hardcoded scan of every month actually present in the
+    dataset (MONTH_ORDER, never a fixed pair of months). A 'round' is
+    approximated by one production-report row (one heading reported in one
+    month = one fired cut/cycle) -- the only proxy for round count this
+    data supports. Ground support is applied per round, roughly independent
+    of how far that round advanced, so a month with unusually short rounds
+    carries the same support overhead spread over fewer metres, inflating
+    N$/m even when nothing about per-item consumption rates changed."""
+    rows = []
+    for month in MONTH_ORDER:
+        period_label = "August (mid-month)" if month == "August" else month
+        pr = production_in_range(month)
+        n_rounds = len(pr) if not pr.empty else None
+        adv = None
+        if not pr.empty and "EOM Advance" in pr.columns:
+            adv_series = pd.to_numeric(pr["EOM Advance"], errors="coerce")
+            if adv_series.notna().any():
+                adv = float(adv_series.sum(skipna=True))
+        avg_advance_per_round = safe_div(adv, n_rounds)
+
+        gs_stk = stocktake_category_slice("ground_support", period_label)
+        drill_stk = stocktake_category_slice("drilling", period_label)
+        gs_cost = total_or_none(gs_stk["cost"]) if not gs_stk.empty else None
+        drill_cost = total_or_none(drill_stk["cost"]) if not drill_stk.empty else None
+        gs_cost_per_round = safe_div(gs_cost, n_rounds)
+        gs_n_per_m = safe_div(gs_cost, adv)
+        drilling_n_per_m = safe_div(drill_cost, adv)
+        total_n_per_m = None
+        if gs_n_per_m is not None or drilling_n_per_m is not None:
+            total_n_per_m = (gs_n_per_m or 0) + (drilling_n_per_m or 0)
+
+        rows.append(dict(
+            month=month, n_rounds=n_rounds, total_advance=adv, avg_advance_per_round=avg_advance_per_round,
+            gs_cost=gs_cost, gs_cost_per_round=gs_cost_per_round, gs_n_per_m=gs_n_per_m,
+            drilling_n_per_m=drilling_n_per_m, total_n_per_m=total_n_per_m,
+        ))
+    tbl = pd.DataFrame(rows)
+
+    baseline_advance_per_round = tbl["avg_advance_per_round"].mean(skipna=True)
+    baseline_gs_cost_per_round = tbl["gs_cost_per_round"].mean(skipna=True)
+    tbl["pct_below_baseline_advance"] = tbl["avg_advance_per_round"].apply(
+        lambda v: safe_div(baseline_advance_per_round - v, baseline_advance_per_round) if pd.notna(v) and baseline_advance_per_round else None
+    )
+    flagged_months = tbl[tbl["pct_below_baseline_advance"].apply(lambda v: v is not None and v > 0.15)]["month"].tolist()
+
+    return dict(
+        table=tbl, baseline_advance_per_round=baseline_advance_per_round,
+        baseline_gs_cost_per_round=baseline_gs_cost_per_round, flagged_months=flagged_months,
+    )
 
 
 def generate_monthly_report(month_label: str) -> dict:
@@ -1025,18 +1157,36 @@ def render_control_room(prod):
     if drill_per_m is not None and gs_per_m is not None:
         total_per_m = drill_per_m + gs_per_m
 
-    usage_cost = total_or_none(usage["cost"]) if not usage.empty else None
-    live_cost = total_or_none(live["cost"]) if not live.empty else None
-    leak_drill = (drill_cost - usage_cost) if (drill_cost is not None and usage_cost is not None) else None
-    leak_gs = (gs_cost - live_cost) if (gs_cost is not None and live_cost is not None) else None
+    # The offsider log only covers May-July, so it's compared against the
+    # SAME three stocktake periods -- comparing it against the full May-Aug
+    # stocktake total would overstate leakage purely from August's extra
+    # spend, which the offsider log never had a chance to record.
+    drill_stk_may_jul = pd.concat([stocktake_category_slice("drilling", m) for m in ["May", "June", "July"]], ignore_index=True)
+    gs_stk_may_jul = pd.concat([stocktake_category_slice("ground_support", m) for m in ["May", "June", "July"]], ignore_index=True)
+    drill_cost_may_jul = total_or_none(drill_stk_may_jul["cost"]) if not drill_stk_may_jul.empty else None
+    gs_cost_may_jul = total_or_none(gs_stk_may_jul["cost"]) if not gs_stk_may_jul.empty else None
+
+    drill_off = drilling_offsider_slice()
+    gs_off = gs_offsider_slice()
+    drill_off_cost = total_or_none(drill_off["cost"]) if not drill_off.empty else None
+    gs_off_cost = total_or_none(gs_off["cost"]) if not gs_off.empty else None
+    leak_drill = (drill_cost_may_jul - drill_off_cost) if (drill_cost_may_jul is not None and drill_off_cost is not None) else None
+    leak_gs = (gs_cost_may_jul - gs_off_cost) if (gs_cost_may_jul is not None and gs_off_cost is not None) else None
     total_leak = None
     if leak_drill is not None or leak_gs is not None:
         total_leak = (leak_drill or 0) + (leak_gs or 0)
-    total_stock_cost = (drill_cost or 0) + (gs_cost or 0) if (drill_cost is not None or gs_cost is not None) else None
-    leak_pct = safe_div(total_leak, total_stock_cost)
+    stock_cost_for_leak = 0.0
+    if leak_drill is not None:
+        stock_cost_for_leak += drill_cost_may_jul
+    if leak_gs is not None:
+        stock_cost_for_leak += gs_cost_may_jul
+    leak_pct = safe_div(total_leak, stock_cost_for_leak) if (leak_drill is not None or leak_gs is not None) else None
     leak_status = "neutral"
     if leak_pct is not None:
         leak_status = "good" if abs(leak_pct) < 0.05 else ("warning" if abs(leak_pct) < 0.15 else "critical")
+
+    design_cost = design_required_cost()
+    over_pct = safe_div(gs_cost - design_cost, design_cost) if (design_cost is not None and gs_cost is not None) else None
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1046,25 +1196,59 @@ def render_control_room(prod):
     with c3:
         kpi_card("Ground support cost intensity", fmt_money(gs_per_m, cur, 2) + "/m", "neutral", "Research question 2", T)
     with c4:
-        kpi_card("Unlogged inventory leakage", fmt_money(to_reporting_currency(total_leak), cur, 0),
-                  leak_status, f"{abs(leak_pct)*100:.1f}% of stocktake spend" if leak_pct is not None else None, T)
-
-    c1, c2 = st.columns(2)
-    with c1:
         kpi_card("Total consumable cost intensity", fmt_money(total_per_m, cur, 2) + "/m", "neutral", "Drilling + ground support, per metre advanced", T)
-    with c2:
-        design_cost = design_required_cost()
+
+    st.markdown("#### Unlogged inventory leakage — physical stocktake vs. offsider issue log")
+    lc1, lc2 = st.columns([1, 1])
+    with lc1:
+        kpi_card("Unlogged inventory leakage", fmt_money(to_reporting_currency(total_leak), cur, 0),
+                  leak_status, f"{leak_pct*100:.1f}% of stocktake spend (drilling + ground support)" if leak_pct is not None else NA, T)
+        st.caption("Physical stocktake cost minus what the offsider issue log recorded. A positive value means stock left the store with no matching paperwork; the offsider log covers May-July only, so August is excluded from this specific comparison.")
+    with lc2:
+        if leak_pct is not None:
+            st.plotly_chart(variance_gauge(abs(leak_pct) * 100, "Leakage %", good=5, warn=15), width="stretch", key="leakage_gauge")
+        else:
+            st.info(NA)
+
+    st.markdown("#### Ground support over-consumption vs. design-required")
+    gc1, gc2 = st.columns([1, 1])
+    with gc1:
         if design_cost is not None and gs_cost is not None:
-            over_pct = safe_div(gs_cost - design_cost, design_cost)
             status = "good" if over_pct is not None and over_pct <= 0 else ("warning" if over_pct is not None and over_pct < 0.5 else "critical")
             kpi_card("Ground support: actual vs. design-required", fmt_money(to_reporting_currency(gs_cost), cur, 0),
-                      status, f"Design-required: {fmt_money(to_reporting_currency(design_cost), cur, 0)}", T)
+                      status, f"Design-required: {fmt_money(to_reporting_currency(design_cost), cur, 0)} ({over_pct*100:+.0f}%)", T)
         else:
             kpi_card("Ground support: actual vs. design-required", NA, "neutral", None, T)
+    with gc2:
+        if over_pct is not None:
+            st.plotly_chart(variance_gauge(over_pct * 100, "Over-consumption vs. design %", good=20, warn=50), width="stretch", key="overconsumption_gauge")
+    if over_pct is not None:
+        overbreak = portal_overbreak_summary()
+        overbreak_txt = ""
+        if not overbreak.empty and set(["North", "South"]).issubset(overbreak.index):
+            overbreak_txt = (
+                f" Average overbreak across the period is {overbreak.loc['North','OverBreak']*100:.1f}% (North) and "
+                f"{overbreak.loc['South','OverBreak']*100:.1f}% (South) -- localized overbreak is one plausible, "
+                f"data-consistent driver of support beyond the design minimum."
+            )
+        st.info(
+            f"Actual ground support spend runs {over_pct*100:.0f}% above the design-standard minimum. The design "
+            f"figure is a *minimum*, so this gap is not automatically waste -- plausible drivers include ground "
+            f"degradation beyond the design assumption, safety re-bolting (support added after the fact where "
+            f"initial support was judged insufficient), and localized overbreak requiring extra bolts/mesh to "
+            f"stabilise a wider-than-designed opening.{overbreak_txt} Confirming which driver applies is a "
+            f"geotechnical judgement call -- record it in the Discrepancy Log."
+        )
 
-    st.markdown("#### Portal performance")
+    st.markdown("#### Portal performance — totals and per-round averages")
     pc1, pc2 = st.columns(2)
     by_portal = prod["by_portal"] if prod else pd.DataFrame()
+    pr_all = production_in_range()
+    pr_by_portal = pd.DataFrame()
+    if not pr_all.empty and "Heading name" in pr_all.columns:
+        d = pr_all.copy()
+        d["portal"] = d["Heading name"].apply(nl.normalize_portal)
+        pr_by_portal, _ = restrict_to_portals(d)
     for col, portal in zip((pc1, pc2), ("North", "South")):
         with col:
             adv_p = by_portal.loc[portal, "advance_m"] if portal in by_portal.index else None
@@ -1072,17 +1256,43 @@ def render_control_room(prod):
             drill_p_cost = total_or_none(drill_p[drill_p["portal"] == portal]["cost"]) if not drill_p.empty else None
             live_p = restrict_to_portals(live)[0]
             live_p_cost = total_or_none(live_p[live_p["portal"] == portal]["cost"]) if not live_p.empty else None
+            total_p_cost = (drill_p_cost or 0) + (live_p_cost or 0)
+            n_rounds_p = len(pr_by_portal[pr_by_portal["portal"] == portal]) if not pr_by_portal.empty else None
+            avg_advance_per_round_p = safe_div(adv_p, n_rounds_p)
+            avg_cost_per_round_p = safe_div(total_p_cost, n_rounds_p) if (drill_p_cost is not None or live_p_cost is not None) else None
             st.markdown(f"**{portal} portal**")
-            kpi_card(f"{portal} advance", fmt_number(adv_p, 1, " m"), "neutral", None, T)
-            kpi_card(f"{portal} drilling + GS cost (store-issue logs)", fmt_money(to_reporting_currency((drill_p_cost or 0) + (live_p_cost or 0)), cur, 0), "neutral", None, T)
+            r1c1, r1c2 = st.columns(2)
+            with r1c1:
+                kpi_card("Total advance", fmt_number(adv_p, 1, " m"), "neutral", "Total", T)
+            with r1c2:
+                kpi_card("Total drilling + GS cost", fmt_money(to_reporting_currency(total_p_cost), cur, 0), "neutral", "Total (store-issue logs)", T)
+            r2c1, r2c2 = st.columns(2)
+            with r2c1:
+                kpi_card("Advance per round", fmt_number(avg_advance_per_round_p, 2, " m"), "neutral", f"{n_rounds_p or 0} rounds fired" if n_rounds_p else None, T)
+            with r2c2:
+                kpi_card("Cost per round", fmt_money(to_reporting_currency(avg_cost_per_round_p), cur, 0), "neutral", "Shift/round average", T)
 
-    st.markdown("#### Ground support cost breakdown")
-    gs_item_costs = gs_stk.groupby("item")["cost"].sum(min_count=1).apply(to_reporting_currency) if not gs_stk.empty else pd.Series(dtype=float)
-    fig = gs_treemap(gs_item_costs)
-    if fig:
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.info(NA)
+    st.markdown("#### Cost breakdown by item")
+    dcol, gcol = st.columns(2)
+    for col, label, stk in ((dcol, "Drilling consumables", drill_stk), (gcol, "Ground support consumables", gs_stk)):
+        with col:
+            st.markdown(f"**{label}**")
+            item_costs = stk.groupby("item")["cost"].sum(min_count=1).apply(to_reporting_currency) if not stk.empty else pd.Series(dtype=float)
+            fig = cost_treemap(item_costs)
+            if fig:
+                st.plotly_chart(fig, width="stretch", key=f"treemap_{label}")
+            else:
+                st.info(NA)
+            table = itemized_breakdown(stk)
+            if not table.empty:
+                table_show = table.copy()
+                table_show["unit_price"] = table_show["unit_price"].apply(lambda v: to_reporting_currency(v))
+                table_show["cost"] = table_show["cost"].apply(lambda v: to_reporting_currency(v))
+                table_show = table_show.rename(columns={
+                    "item": "Item", "quantity": "Quantity", "unit_price": f"Unit price ({cur})",
+                    "cost": f"Cost ({cur})", "pct_of_category": "% of category",
+                })
+                st.dataframe(table_show, width="stretch", hide_index=True, height=280)
 
     with notes_expander("Data sources & methodology notes"):
         st.caption("Formulas: UC_drill = drilling consumable cost / metres advanced. UC_support = ground support consumable cost / metres advanced. UC_total = (labour + machine)/advance rate + UC_drill + UC_support.")
@@ -1097,9 +1307,9 @@ def render_control_room(prod):
         ]
         st.dataframe(pd.DataFrame(rows, columns=["Source", "Rows loaded"]), width="stretch", hide_index=True)
 
-        mismatches = nl.compare_price_sources(DATA["monthly_totals"], DATA["prices"])
+        mismatches = price_source_comparison()
         if not mismatches.empty:
-            st.warning(f"{len(mismatches)} drilling item(s) have a reference price that disagrees with the price actually applied to real transactions by more than 1.5x. The operational price is used throughout.")
+            st.warning(f"{len(mismatches)} drilling item(s): the unit cost typed into the monthly stock-usage workbook disagrees with the official static price list by more than 1.5x. The official price list is used for every cost on this app; the workbook figure is shown here only as a data-quality flag worth raising with whoever maintains that workbook.")
             wrapped_table(mismatches, height=140, key="ag_price_mismatches", T=T)
 
         neg = stocktake_flagged_negative()
@@ -1185,14 +1395,18 @@ def render_reconciliation(prod):
 
 def render_leakage_bityield():
     cur = currency()
-    st.markdown("#### Ground support: physical count vs. logged usage vs. design requirement")
-    stk_gs_cost = total_or_none(stocktake_category_slice("ground_support")["cost"])
-    live_cost = total_or_none(gs_live_slice()["cost"])
+    st.markdown("#### Ground support: Design Required → Offsider Issue Log → Physical Stocktake")
+    st.caption("All four stages are restricted to May-July 2026, the offsider log's only coverage window, so every step compares the same period.")
+    may_jul_gs_stk = pd.concat([stocktake_category_slice("ground_support", m) for m in ["May", "June", "July"]], ignore_index=True)
+    stk_gs_cost = total_or_none(may_jul_gs_stk["cost"]) if not may_jul_gs_stk.empty else None
+    live_may_jul = filter_dates(DATA["gs_live"])
+    live_may_jul = live_may_jul[(live_may_jul["category"] == "ground_support") & (live_may_jul["date"] < pd.Timestamp(2026, 8, 1))]
+    live_cost = total_or_none(attach_gs_cost(live_may_jul)["cost"]) if not live_may_jul.empty else None
     offsider_cost = total_or_none(gs_offsider_slice()["cost"])
-    design_cost = design_required_cost()
+    design_cost = design_required_cost(months=["May", "June", "July"])
     fig = gs_waterfall_chart(
-        to_reporting_currency(design_cost), to_reporting_currency(stk_gs_cost),
-        to_reporting_currency(live_cost), to_reporting_currency(offsider_cost), cur,
+        to_reporting_currency(design_cost), to_reporting_currency(offsider_cost),
+        to_reporting_currency(stk_gs_cost), to_reporting_currency(live_cost), cur,
     )
     if fig:
         st.plotly_chart(fig, width="stretch")
@@ -1267,13 +1481,39 @@ def render_leakage_bityield():
          "note": "Cross-check flagged months against the jumbo bolting schedule before finalising -- this can be a legitimate catch-up pass rather than waste."},
     ]
     if "discrepancy_table" not in st.session_state:
-        st.session_state["discrepancy_table"] = pd.DataFrame(default_rows)
+        df0 = pd.DataFrame(default_rows)
+        df0["suggested_cause"] = "-- none selected --"
+        st.session_state["discrepancy_table"] = df0
+
+    EXPERT_CAUSES = [
+        "-- none selected --", "Unrecorded scrap (item damaged/discarded, not written off)",
+        "Shift-change handover omission (issued by one shift, not logged before handover)",
+        "Unlogged off-site transfer (moved to another section/site without a transfer note)",
+        "Timing lag (physically counted before the matching issue was recorded)",
+        "Other (see note)",
+    ]
+    st.caption("Expert-suggested causes for unlogged movement are offered alongside your own site notes -- pick one as a starting point, or write your own in the note field below.")
     edited = wrapped_table(
         st.session_state["discrepancy_table"], height=420, editable=True,
-        select_columns={"classification": ["Geotechnical necessity", "Operator-related waste", "Operator-related waste (tentative)", "Undetermined"]},
+        select_columns={
+            "classification": ["Geotechnical necessity", "Operator-related waste", "Operator-related waste (tentative)", "Undetermined"],
+            "suggested_cause": EXPERT_CAUSES,
+        },
         key="ag_discrepancy_log", T=T,
     )
     st.session_state["discrepancy_table"] = edited
+
+    with notes_expander("Add or edit a custom site note", expanded=False):
+        if not edited.empty:
+            row_labels = edited["item_or_area"].tolist()
+            selected_label = st.selectbox("Discrepancy item", row_labels, key="discrepancy_note_selector")
+            row_idx = edited.index[edited["item_or_area"] == selected_label][0]
+            current_note = edited.loc[row_idx, "note"] if "note" in edited.columns else ""
+            new_note = st.text_area("Your site note for this item", value=current_note or "", height=100, key=f"note_input_{row_idx}")
+            if st.button("Save note", key="save_discrepancy_note"):
+                st.session_state["discrepancy_table"].loc[row_idx, "note"] = new_note
+                st.rerun()
+
     csv = edited.to_csv(index=False).encode("utf-8")
     st.download_button("Download discrepancy log as CSV", csv, file_name="discrepancy_log.csv", mime="text/csv")
 
@@ -1282,11 +1522,13 @@ def render_leakage_bityield():
 # TAB: Sensitivity Simulator
 # ---------------------------------------------------------------------------
 
-def render_sensitivity_simulator(prod):
-    cur = currency()
+def compute_sensitivity_inputs(prod):
+    """Shared by the main sensitivity model, the continuous curve, and the
+    fixed-increment export matrix, so all three always agree with each
+    other on variable cost per metre, fixed cost per shift, and baseline
+    rate."""
     drill_stk = stocktake_category_slice("drilling")
     gs_stk = stocktake_category_slice("ground_support")
-
     adv = prod["total_advance"] if prod else None
     baseline_rate = prod["avg_rate_per_shift"] if prod else None
     drill_cost = to_reporting_currency(total_or_none(drill_stk["cost"])) if not drill_stk.empty else None
@@ -1294,12 +1536,44 @@ def render_sensitivity_simulator(prod):
     variable_cost_per_m = None
     if drill_cost is not None and gs_cost is not None and adv:
         variable_cost_per_m = (drill_cost + gs_cost) / adv
-
     labour = to_reporting_currency(st.session_state["fixed_labour_cost_per_shift"])
     machine = to_reporting_currency(st.session_state["fixed_machine_cost_per_shift"])
     fixed_cost_per_shift = None
     if labour is not None or machine is not None:
         fixed_cost_per_shift = (labour or 0) + (machine or 0)
+    return variable_cost_per_m, fixed_cost_per_shift, baseline_rate
+
+
+def sensitivity_matrix_fixed_increments(variable_cost_per_m, fixed_cost_per_shift, rate_min=1.5, rate_max=4.0, step=0.5):
+    """Predicted total unit cost at fixed 0.5 m/shift increments, independent
+    of today's actual baseline rate -- a reference matrix for 'what would it
+    cost at exactly this rate', not tied to current performance."""
+    if variable_cost_per_m is None or fixed_cost_per_shift is None:
+        return None
+    rates = np.arange(rate_min, rate_max + step / 2, step).round(2)
+    rows = []
+    for r in rates:
+        fixed_component = fixed_cost_per_shift / r
+        rows.append({
+            "advance_rate_m_per_shift": float(r), "fixed_cost_component_n_per_m": fixed_component,
+            "variable_cost_component_n_per_m": variable_cost_per_m, "total_unit_cost_n_per_m": fixed_component + variable_cost_per_m,
+        })
+    return pd.DataFrame(rows)
+
+
+def df_to_xlsx_bytes(sheets: dict) -> bytes:
+    """sheets: {sheet_name: DataFrame}."""
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+    return buf.getvalue()
+
+
+def render_sensitivity_simulator(prod):
+    cur = currency()
+    variable_cost_per_m, fixed_cost_per_shift, baseline_rate = compute_sensitivity_inputs(prod)
 
     missing_bits = []
     if variable_cost_per_m is None:
@@ -1357,12 +1631,73 @@ def render_sensitivity_simulator(prod):
     fig2 = sensitivity_chart(result, cur)
     st.plotly_chart(fig2, width="stretch")
 
+    st.markdown("#### Export matrix — predicted unit cost at fixed advance-rate increments")
+    st.caption("1.5 to 4.0 m/shift in 0.5 m steps, independent of the current baseline rate above.")
+    matrix = sensitivity_matrix_fixed_increments(variable_cost_per_m, fixed_cost_per_shift)
+    if matrix is not None:
+        matrix_show = matrix.rename(columns={
+            "advance_rate_m_per_shift": "Advance rate (m/shift)", "fixed_cost_component_n_per_m": f"Fixed cost ({cur}/m)",
+            "variable_cost_component_n_per_m": f"Variable cost ({cur}/m)", "total_unit_cost_n_per_m": f"Total unit cost ({cur}/m)",
+        })
+        st.dataframe(matrix_show, width="stretch", hide_index=True)
+        xlsx_bytes = df_to_xlsx_bytes({"Sensitivity Matrix": matrix_show})
+        st.download_button("Download Matrix (.xlsx)", xlsx_bytes, file_name="sensitivity_matrix.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    else:
+        st.info(NA)
+
 
 # ---------------------------------------------------------------------------
 # TAB: Monthly Report
 # ---------------------------------------------------------------------------
 
+def render_round_efficiency():
+    cur = currency()
+    st.markdown("#### Round efficiency across the analysed period")
+    st.caption("Scanned dynamically across every month in the dataset -- not a fixed comparison of any two specific months.")
+    eff = round_efficiency_table()
+    tbl = eff["table"]
+
+    b1, b2 = st.columns(2)
+    with b1:
+        kpi_card("Normal baseline — advance per round", fmt_number(eff["baseline_advance_per_round"], 2, " m"), "neutral", "Average across all months", T)
+    with b2:
+        kpi_card("Normal baseline — support cost per round", fmt_money(to_reporting_currency(eff["baseline_gs_cost_per_round"]), cur, 0), "neutral", "Average across all months", T)
+
+    show = tbl.copy()
+    show["gs_cost_per_round"] = show["gs_cost_per_round"].apply(lambda v: to_reporting_currency(v))
+    show["gs_n_per_m"] = show["gs_n_per_m"].apply(lambda v: to_reporting_currency(v))
+    show["drilling_n_per_m"] = show["drilling_n_per_m"].apply(lambda v: to_reporting_currency(v))
+    show["total_n_per_m"] = show["total_n_per_m"].apply(lambda v: to_reporting_currency(v))
+    show["pct_below_baseline_advance"] = show["pct_below_baseline_advance"].apply(lambda v: v * 100 if v is not None else None)
+    show = show.rename(columns={
+        "month": "Month", "n_rounds": "Rounds fired", "total_advance": "Total advance (m)",
+        "avg_advance_per_round": "Advance/round (m)", "gs_cost_per_round": f"Support cost/round ({cur})",
+        "gs_n_per_m": f"Support ({cur}/m)", "drilling_n_per_m": f"Drilling ({cur}/m)", "total_n_per_m": f"Total ({cur}/m)",
+        "pct_below_baseline_advance": "% below baseline advance/round",
+    })
+    st.dataframe(show.drop(columns=["gs_cost"], errors="ignore"), width="stretch", hide_index=True)
+
+    fig = round_efficiency_chart(tbl["month"].tolist(), tbl["avg_advance_per_round"].tolist(),
+                                  [to_reporting_currency(v) for v in tbl["total_n_per_m"]], cur)
+    st.plotly_chart(fig, width="stretch", key="round_efficiency_chart")
+
+    if eff["flagged_months"]:
+        months_txt = ", ".join(eff["flagged_months"])
+        st.warning(
+            f"**{months_txt}**: advance per round runs more than 15% below the {eff['baseline_advance_per_round']:.2f} m "
+            f"baseline. Mechanism: ground support (bolts and mesh) is applied per round fired, largely independent "
+            f"of how far that round advanced. A month with shorter rounds carries the same fixed support overhead "
+            f"per round spread over fewer metres, inflating {cur}/m even if physical consumption per item remains "
+            f"normal for every individual item. This is a round-efficiency effect, not necessarily over-consumption."
+        )
+    else:
+        st.caption("No month runs more than 15% below the period baseline for advance per round.")
+
+
 def render_monthly_report():
+    render_round_efficiency()
+    st.divider()
     cur = currency()
     c1, c2 = st.columns([1, 3])
     with c1:
@@ -1455,6 +1790,176 @@ def render_monthly_report():
     else:
         st.caption(NA)
     st.caption("Note: bolt breakage counts are not captured in any loaded data source, so breakage is not part of this automated analysis. Record breakage observations in the discrepancy log.")
+
+
+# ---------------------------------------------------------------------------
+# TAB: Research Findings + document exports
+# ---------------------------------------------------------------------------
+
+def compile_research_findings(prod) -> dict:
+    cur = currency()
+    drill_stk = stocktake_category_slice("drilling")
+    gs_stk = stocktake_category_slice("ground_support")
+    adv = prod["total_advance"] if prod else None
+    drill_cost = total_or_none(drill_stk["cost"]) if not drill_stk.empty else None
+    gs_cost = total_or_none(gs_stk["cost"]) if not gs_stk.empty else None
+    drill_per_m = safe_div(to_reporting_currency(drill_cost), adv)
+    gs_per_m = safe_div(to_reporting_currency(gs_cost), adv)
+
+    gs_items = itemized_breakdown(gs_stk)
+    top_gs_items = gs_items.head(3)["item"].tolist() if not gs_items.empty else []
+
+    design_cost = design_required_cost()
+    over_pct = safe_div(gs_cost - design_cost, design_cost) if (design_cost is not None and gs_cost is not None) else None
+
+    variable_cost_per_m, fixed_cost_per_shift, baseline_rate = compute_sensitivity_inputs(prod)
+    sensitivity_result = None
+    if all(v is not None for v in (variable_cost_per_m, fixed_cost_per_shift, baseline_rate)):
+        pcts = [0.0, st.session_state["optimistic_pct"] / 100.0, st.session_state["max_capacity_pct"] / 100.0]
+        sensitivity_result = mc.sensitivity_model(variable_cost_per_m, fixed_cost_per_shift, baseline_rate, pcts)
+
+    return dict(
+        currency=cur,
+        rq1_drilling_n_per_m=drill_per_m,
+        rq2_gs_n_per_m=gs_per_m, rq2_top_items=top_gs_items, rq2_over_pct=over_pct,
+        rq3_avg_rate=prod["avg_rate_per_shift"] if prod else None,
+        rq3_total_advance=prod["total_advance"] if prod else None,
+        rq4_sensitivity=sensitivity_result,
+        rq4_optimistic_pct=st.session_state["optimistic_pct"], rq4_max_pct=st.session_state["max_capacity_pct"],
+    )
+
+
+def render_research_findings(prod):
+    f = compile_research_findings(prod)
+    cur = f["currency"]
+
+    st.markdown("### Research findings")
+    st.caption("Direct answers to the study's four research questions, computed live from the currently loaded data.")
+
+    st.markdown("#### RQ1 — Drilling consumable unit cost")
+    kpi_card("Drilling cost per metre advanced", fmt_money(f["rq1_drilling_n_per_m"], cur, 2) + "/m", "neutral",
+              "Bits, rods, shanks, couplings — physical stocktake basis, official static price list", T)
+
+    st.markdown("#### RQ2 — Ground support consumable unit cost and cost drivers")
+    c1, c2 = st.columns(2)
+    with c1:
+        kpi_card("Ground support cost per metre advanced", fmt_money(f["rq2_gs_n_per_m"], cur, 2) + "/m", "neutral", None, T)
+    with c2:
+        over_txt = f"{f['rq2_over_pct']*100:+.0f}% vs. design-required" if f["rq2_over_pct"] is not None else NA
+        kpi_card("Actual vs. design-required", over_txt, "neutral", None, T)
+    if f["rq2_top_items"]:
+        st.markdown("Top cost drivers: " + ", ".join(f["rq2_top_items"]))
+
+    st.markdown("#### RQ3 — Productivity baseline")
+    st.info(
+        f"**Established productivity baseline: {fmt_number(f['rq3_avg_rate'], 2, ' m/shift')}**, from "
+        f"{fmt_number(f['rq3_total_advance'], 1, ' m')} total advance across the analysed period (May-August 2026)."
+    )
+
+    st.markdown("#### RQ4 — Impact of advance-rate scenarios on total unit cost")
+    if f["rq4_sensitivity"] is not None:
+        res = f["rq4_sensitivity"]
+        baseline_row, best_row = res.iloc[0], res.iloc[-1]
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            kpi_card("Baseline total unit cost", fmt_money(baseline_row["total_unit_cost_n_per_m"], cur, 2) + "/m", "neutral", None, T)
+        with c2:
+            kpi_card(f"Optimistic (+{f['rq4_optimistic_pct']}%)", fmt_money(res.iloc[1]["total_unit_cost_n_per_m"], cur, 2) + "/m", "good", None, T)
+        with c3:
+            kpi_card(f"Maximum capacity (+{f['rq4_max_pct']}%)", fmt_money(best_row["total_unit_cost_n_per_m"], cur, 2) + "/m", "good", None, T)
+    else:
+        st.info(NA + " (set fixed labour/machine cost in the control panel to compute this)")
+
+    st.divider()
+    st.markdown("#### Export findings")
+    ec1, ec2, ec3 = st.columns(3)
+    with ec1:
+        st.download_button("Download Findings (.xlsx)", generate_findings_xlsx(f), file_name="devadvance_research_findings.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with ec2:
+        st.download_button("Download Findings (.pdf)", generate_findings_pdf(f), file_name="devadvance_research_findings.pdf", mime="application/pdf")
+    with ec3:
+        st.download_button("Download Findings (.docx)", generate_findings_docx(f), file_name="devadvance_research_findings.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+def _findings_lines(f: dict) -> list[tuple[str, str]]:
+    cur = f["currency"]
+    lines = [
+        ("RQ1 — Drilling consumable unit cost", fmt_money(f["rq1_drilling_n_per_m"], cur, 2) + "/m"),
+        ("RQ2 — Ground support consumable unit cost", fmt_money(f["rq2_gs_n_per_m"], cur, 2) + "/m"),
+        ("RQ2 — Top ground support cost drivers", ", ".join(f["rq2_top_items"]) if f["rq2_top_items"] else NA),
+        ("RQ2 — Actual vs. design-required", f"{f['rq2_over_pct']*100:+.0f}%" if f["rq2_over_pct"] is not None else NA),
+        ("RQ3 — Productivity baseline", fmt_number(f["rq3_avg_rate"], 2, " m/shift")),
+        ("RQ3 — Total advance (May-Aug 2026)", fmt_number(f["rq3_total_advance"], 1, " m")),
+    ]
+    if f["rq4_sensitivity"] is not None:
+        res = f["rq4_sensitivity"]
+        lines.append(("RQ4 — Baseline total unit cost", fmt_money(res.iloc[0]["total_unit_cost_n_per_m"], cur, 2) + "/m"))
+        lines.append((f"RQ4 — Optimistic (+{f['rq4_optimistic_pct']}%)", fmt_money(res.iloc[1]["total_unit_cost_n_per_m"], cur, 2) + "/m"))
+        lines.append((f"RQ4 — Maximum capacity (+{f['rq4_max_pct']}%)", fmt_money(res.iloc[-1]["total_unit_cost_n_per_m"], cur, 2) + "/m"))
+    else:
+        lines.append(("RQ4 — Sensitivity model", NA))
+    return lines
+
+
+def generate_findings_xlsx(f: dict) -> bytes:
+    lines = _findings_lines(f)
+    df = pd.DataFrame(lines, columns=["Finding", "Value"])
+    sheets = {"Research Findings": df}
+    if f["rq4_sensitivity"] is not None:
+        sheets["Sensitivity Model"] = f["rq4_sensitivity"]
+    return df_to_xlsx_bytes(sheets)
+
+
+def _pdf_safe(text: str) -> str:
+    """fpdf2's built-in core fonts (Helvetica) are Latin-1 only -- em/en
+    dashes and similar typographic characters raise FPDFUnicodeEncodingException.
+    Downgrade to plain ASCII equivalents rather than bundling a Unicode font
+    just for a summary export."""
+    return (
+        str(text).replace("—", "-").replace("–", "-").replace("‘", "'").replace("’", "'")
+        .replace("“", '"').replace("”", '"')
+    )
+
+
+def generate_findings_pdf(f: dict) -> bytes:
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "DevAdvance Analytics - Research Findings", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 8, "Underground development cost and productivity, May-August 2026", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "", 11)
+    for label, value in _findings_lines(f):
+        # w=0 ("auto-width to right margin") intermittently miscomputes
+        # available width across a bold/regular font-style switch in this
+        # fpdf2 version, raising FPDFException; an explicit width (epw,
+        # the page's own effective printable width) sidesteps it reliably.
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.multi_cell(pdf.epw, 7, _pdf_safe(label))
+        pdf.set_x(pdf.l_margin)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.multi_cell(pdf.epw, 7, _pdf_safe(value))
+        pdf.ln(2)
+    return bytes(pdf.output())
+
+
+def generate_findings_docx(f: dict) -> bytes:
+    import io
+    from docx import Document
+    doc = Document()
+    doc.add_heading("DevAdvance Analytics — Research Findings", level=1)
+    doc.add_paragraph("Underground development cost and productivity, May-August 2026")
+    for label, value in _findings_lines(f):
+        doc.add_heading(label, level=3)
+        doc.add_paragraph(str(value))
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1692,7 +2197,7 @@ else:
 
 tab_labels = [
     "Control Room", "Meter Reconciliation", "Consumable Leakage & Bit Yield",
-    "Sensitivity Simulator", "Monthly Report", "Bring Your Own Data",
+    "Sensitivity Simulator", "Monthly Report", "Research Findings", "Bring Your Own Data",
 ]
 tabs = st.tabs(tab_labels)
 with tabs[0]:
@@ -1706,4 +2211,6 @@ with tabs[3]:
 with tabs[4]:
     render_monthly_report()
 with tabs[5]:
+    render_research_findings(_prod)
+with tabs[6]:
     render_byod()
